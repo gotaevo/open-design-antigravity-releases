@@ -176,8 +176,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $assets = Get-ChildItem -LiteralPath release-assets -File | Select-Object -ExpandProperty FullName
           if ($env:EXISTING_RELEASE -eq "true") {
-            gh release upload $env:RELEASE_TAG $assets --clobber
-            gh release edit $env:RELEASE_TAG --latest
+            gh release upload $env:RELEASE_TAG $assets --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $env:RELEASE_TAG --latest --repo $env:GITHUB_REPOSITORY
           } else {
             $notes = @"
           Open Design Antigravity $env:VERSION for Windows x64.
@@ -188,6 +188,7 @@ jobs:
           The installer is currently unsigned. Verify it with the published SHA-256 file.
           "@
             gh release create $env:RELEASE_TAG $assets `
+              --repo $env:GITHUB_REPOSITORY `
               --target $env:GITHUB_SHA `
               --title "Open Design Antigravity $env:VERSION" `
               --notes $notes `

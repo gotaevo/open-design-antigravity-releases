@@ -10,4 +10,19 @@ describe("Windows release workflow", () => {
     assert.match(workflow, /Invoke-RestMethod/);
     assert.match(workflow, /exists=/);
   });
+
+  it("targets the public repository without relying on the working directory", () => {
+    assert.match(
+      workflow,
+      /gh release upload \$env:RELEASE_TAG \$assets --clobber --repo \$env:GITHUB_REPOSITORY/,
+    );
+    assert.match(
+      workflow,
+      /gh release edit \$env:RELEASE_TAG --latest --repo \$env:GITHUB_REPOSITORY/,
+    );
+    assert.match(
+      workflow,
+      /gh release create \$env:RELEASE_TAG \$assets `[\s\S]*?--repo \$env:GITHUB_REPOSITORY/,
+    );
+  });
 });
