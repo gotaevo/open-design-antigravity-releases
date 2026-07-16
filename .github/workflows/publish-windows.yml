@@ -1,0 +1,193 @@
+name: Publish Windows stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Private source tag (antigravity-vX.Y.Z)
+        required: true
+        type: string
+  schedule:
+    - cron: "17 9 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: antigravity-windows-stable-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout public release channel
+        uses: actions/checkout@v6.0.2
+        with:
+          path: release-channel
+
+      - name: Checkout private source with read-only deploy key
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: gotaevo/open-design-antigravity
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Resolve and validate source tag
+        id: release
+        shell: pwsh
+        env:
+          REQUESTED_SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:REQUESTED_SOURCE_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = git -C source tag --list "antigravity-v*" --sort=-version:refname | Select-Object -First 1
+          }
+          if ($tag -notmatch '^antigravity-v(?<version>\d+\.\d+\.\d+)$') {
+            throw "invalid or missing source tag: $tag"
+          }
+          $commit = git -C source rev-list -n 1 $tag
+          if ([string]::IsNullOrWhiteSpace($commit)) {
+            throw "source tag does not resolve to a commit: $tag"
+          }
+          git -C source checkout --detach $commit
+          if ($LASTEXITCODE -ne 0) { throw "failed to checkout source tag $tag" }
+          "source_tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source_commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$($Matches.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_tag=v$($Matches.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Skip an already complete release
+        id: existing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $artifact = "open-design-antigravity-$env:VERSION-win-x64-setup.exe"
+          $names = @(gh release view $env:RELEASE_TAG --json assets --jq '.assets[].name' 2>$null)
+          $complete =
+            $names -contains $artifact -and
+            $names -contains "$artifact.sha256" -and
+            $names -contains "metadata.json"
+          "complete=$($complete.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup pnpm
+        if: steps.existing.outputs.complete != 'true'
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        if: steps.existing.outputs.complete != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Test release metadata generator
+        if: steps.existing.outputs.complete != 'true'
+        working-directory: release-channel
+        run: node --test tests/generate-metadata.test.mjs
+
+      - name: Install source dependencies
+        if: steps.existing.outputs.complete != 'true'
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup NSIS
+        if: steps.existing.outputs.complete != 'true'
+        shell: pwsh
+        run: |
+          if ((Get-Command makensis.exe -ErrorAction SilentlyContinue) -or (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) {
+            exit 0
+          }
+          choco install nsis -y --no-progress
+
+      - name: Build portable Windows installer
+        if: steps.existing.outputs.complete != 'true'
+        shell: pwsh
+        working-directory: source
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolsPackDir = Join-Path $env:RUNNER_TEMP "antigravity-tools-pack"
+          $cacheDir = Join-Path $env:RUNNER_TEMP "antigravity-tools-pack-cache"
+          $buildOutput = pnpm.cmd exec tools-pack win build `
+            --dir $toolsPackDir `
+            --cache-dir $cacheDir `
+            --namespace default `
+            --portable `
+            --app-version $env:VERSION `
+            --to nsis `
+            --json
+          if ($LASTEXITCODE -ne 0) { throw "tools-pack build exited with code $LASTEXITCODE" }
+          $build = $buildOutput | ConvertFrom-Json
+          $installerPath = [string]$build.installerPath
+          if ([string]::IsNullOrWhiteSpace($installerPath) -or -not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "tools-pack did not produce an installer"
+          }
+          $assetsDir = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+          $artifactName = "open-design-antigravity-$env:VERSION-win-x64-setup.exe"
+          $artifactPath = Join-Path $assetsDir $artifactName
+          Copy-Item -LiteralPath $installerPath -Destination $artifactPath
+          $hash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$artifactPath.sha256", "$hash  $artifactName`n", [Text.UTF8Encoding]::new($false))
+          node ..\release-channel\scripts\generate-metadata.mjs `
+            --source-tag "antigravity-v$env:VERSION" `
+            --repository $env:GITHUB_REPOSITORY `
+            --artifact $artifactPath `
+            --output (Join-Path $assetsDir "metadata.json")
+
+      - name: Publish GitHub Release assets
+        if: steps.existing.outputs.complete != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          SOURCE_TAG: ${{ steps.release.outputs.source_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = Get-ChildItem -LiteralPath release-assets -File | Select-Object -ExpandProperty FullName
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $assets --clobber
+            gh release edit $env:RELEASE_TAG --latest
+          } else {
+            $notes = @"
+          Open Design Antigravity $env:VERSION for Windows x64.
+
+          Private source tag: $env:SOURCE_TAG
+          Source commit: $env:SOURCE_COMMIT
+
+          The installer is currently unsigned. Verify it with the published SHA-256 file.
+          "@
+            gh release create $env:RELEASE_TAG $assets `
+              --target $env:GITHUB_SHA `
+              --title "Open Design Antigravity $env:VERSION" `
+              --notes $notes `
+              --latest
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed" }
+
+      - name: Verify public latest metadata
+        if: steps.existing.outputs.complete != 'true'
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/metadata.json"
+          $metadata = Invoke-RestMethod -Uri $url
+          if ($metadata.stableVersion -ne $env:EXPECTED_VERSION) {
+            throw "latest metadata version mismatch: $($metadata.stableVersion)"
+          }
